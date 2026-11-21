@@ -8,10 +8,13 @@ import os
 import subprocess
 import sys
 import threading
+import time
 import uuid
 import webbrowser
 from concurrent.futures import ThreadPoolExecutor
+from http.server import BaseHTTPRequestHandler, HTTPServer
 from pathlib import Path
+from urllib.parse import parse_qs, urlencode, urlparse
 
 import customtkinter as ctk
 import minecraft_launcher_lib as mll
@@ -26,7 +29,10 @@ REG_FILE = GAME / "mvp-installed.json"
 UA = {"User-Agent": "MVP-Client/1.0 (launcher minecraft)"}
 MR = "https://api.modrinth.com/v2"
 CF = "https://api.curseforge.com/v1"
-REDIRECT = "https://login.live.com/oauth20_desktop.srf"
+REDIRECT = "http://localhost:8765"
+PAGE = 12
+AZURE_URL = "https://portal.azure.com/#view/Microsoft_AAD_RegisteredApps/ApplicationsListBlade"
+MOJANG_FORM = "https://aka.ms/mce-reviewappid"
 
 BG, PANEL, CARD, CARD2 = "#0A0C11", "#10131A", "#171B25", "#1E2330"
 ACCENT, ACCENT_H, CYAN, MUTED, OK, ERR = "#8B5CF6", "#7C3AED", "#22D3EE", "#8A93A6", "#34D399", "#F87171"
@@ -59,11 +65,19 @@ DEFAULTS = {"username": "Player", "ram_mb": 0, "jvm_preset": "FPS máximo (G1 ot
             "iris": False, "options_applied": False}
 
 BUNDLES = {
-    "Cosméticos 3D": {"desc": "Avatares e modelos 3D (Figura) e camadas 3D da skin. Funcionam também em contas offline.",
-                      "mods": ["figura", "skin-layers-3d"], "keys": {}},
-    "Menu e HUD estilo Lunar": {"desc": "Mod Menu no Right Shift, zoom, F3 melhorado, HUD de armadura/comida e câmara livre.",
-                                "mods": ["modmenu", "yacl", "zoomify", "betterf3", "appleskin", "freelook"],
-                                "keys": {"key_key.modmenu.open_menu": "key.keyboard.right.shift"}},
+    "Menu principal personalizado": {
+        "desc": "FancyMenu: botões do menu à esquerda, a tua skin 3D grande à direita (elemento Player Entity) e fundo à tua escolha (imagem, vídeo, panorama).",
+        "mods": ["fancymenu", "konkrete", "melody"], "keys": {}},
+    "Menu no jogo (Right Shift)": {
+        "desc": "Mod Menu com todos os mods e configs, Zoomify, Freelook (perspetiva livre), F3 melhorado e HUD de armadura/comida.",
+        "mods": ["modmenu", "yacl", "cloth-config", "zoomify", "freelook", "betterf3", "appleskin"],
+        "keys": {"key_key.modmenu.open_menu": "key.keyboard.right.shift"}},
+    "Visuais": {
+        "desc": "Shaders (Iris), luz dinâmica e texturas conectadas.",
+        "mods": ["iris", "lambdynamiclights", "continuity"], "keys": {}},
+    "Cosméticos 3D": {
+        "desc": "Avatares e modelos 3D (Figura) e camadas 3D da skin. Funcionam também em contas offline (só tu os vês).",
+        "mods": ["figura", "skin-layers-3d"], "keys": {}},
 }
 
 S = requests.Session()
@@ -178,7 +192,7 @@ def mr_search(query, kind, sort, offset):
     if kind == "mod":
         facets.append(["categories:fabric"])
     r = S.get(f"{MR}/search", params={"query": query, "facets": json.dumps(facets), "index": MR_SORT[sort],
-                                     "limit": 20, "offset": offset}, timeout=20)
+                                     "limit": PAGE, "offset": offset}, timeout=20)
     r.raise_for_status()
     return [{"source": "modrinth", "id": h["project_id"], "title": h["title"], "desc": h["description"],
              "icon": h.get("icon_url"), "downloads": h["downloads"], "author": h["author"], "kind": kind,
@@ -231,7 +245,7 @@ def cf_search(key, query, kind, sort, offset):
     if not key:
         raise RuntimeError("Falta a chave da API do CurseForge (Definições).")
     p = {"gameId": 432, "classId": CF_CLASS[kind], "gameVersion": MC_VERSION, "searchFilter": query,
-         "sortField": CF_SORT[sort], "sortOrder": "desc", "pageSize": 20, "index": offset}
+         "sortField": CF_SORT[sort], "sortOrder": "desc", "pageSize": PAGE, "index": offset}
     if kind == "mod":
         p["modLoaderType"] = 4
     r = S.get(f"{CF}/mods/search", params=p, headers=cf_headers(key), timeout=20)
@@ -293,7 +307,8 @@ class App(ctk.CTk):
         self.minsize(980, 640)
         self.configure(fg_color=BG)
         self.after(300, lambda: self._set_icon())
-        self.pool = ThreadPoolExecutor(6)
+        self.pool = ThreadPoolExecutor(4)
+        self.ipool = ThreadPoolExecutor(3)
         self.icons = {}
         self.pmax = 1
         self.busy = False
@@ -427,8 +442,9 @@ class App(ctk.CTk):
         ctk.CTkButton(row, text="Adicionar offline", height=40, fg_color=ACCENT, hover_color=ACCENT_H,
                       command=self.add_offline).pack(side="left", padx=8)
         ctk.CTkButton(row, text="Adicionar conta Microsoft", height=40, fg_color=CARD2, command=self.ms_login).pack(side="left")
+        ctk.CTkButton(row, text="Como ativar", height=40, fg_color=CARD2, command=self.ms_guide).pack(side="left", padx=8)
         self.acc_msg = ctk.CTkLabel(card, text="Offline funciona logo (não entra em servidores online-mode). "
-                                    "Microsoft precisa do Azure Client ID nas Definições.", text_color=MUTED,
+                                    "Conta original: carrega em «Como ativar» (precisa de um Client ID aprovado pela Mojang).", text_color=MUTED,
                                     anchor="w", wraplength=760, justify="left")
         self.acc_msg.pack(fill="x", padx=22, pady=(0, 16))
         self.acc_list = ctk.CTkScrollableFrame(p, fg_color=PANEL, corner_radius=12)
@@ -484,9 +500,23 @@ class App(ctk.CTk):
         self.status.configure(text=t)
 
     def cb(self):
-        return {"setStatus": lambda t: self.ui(self.set_status, t),
-                "setMax": lambda m: setattr(self, "pmax", max(1, m)),
-                "setProgress": lambda v: self.ui(self.bar.set, min(1, v / self.pmax))}
+        last = {"p": 0.0, "s": 0.0}
+
+        def prog(v):
+            now = time.monotonic()
+            if now - last["p"] < 0.12 and v < self.pmax:
+                return
+            last["p"] = now
+            self.ui(self.bar.set, min(1, v / self.pmax))
+
+        def stat(t):
+            now = time.monotonic()
+            if now - last["s"] < 0.2:
+                return
+            last["s"] = now
+            self.ui(self.set_status, t)
+        return {"setStatus": stat, "setProgress": prog,
+                "setMax": lambda m: setattr(self, "pmax", max(1, m))}
 
     def on_play(self):
         if self.busy:
@@ -610,58 +640,84 @@ class App(ctk.CTk):
             try:
                 items = mr_search(q, kind, sort, off) if src == "Modrinth" else cf_search(self.cfg["curseforge_key"], q, kind, sort, off)
                 if tok == self.search_token:
-                    self.ui(self.render_results, items)
+                    self.ui(self.render_results, items, tok)
             except Exception as e:
                 self.ui(lambda: self.mod_msg.configure(text=f"Erro: {e}", text_color=ERR))
         self.pool.submit(work)
 
-    def render_results(self, items):
+    def render_results(self, items, tok):
         for w in self.results.winfo_children():
             if getattr(w, "_more", False):
                 w.destroy()
-        reg = load_json(REG_FILE, {})
-        for it in items:
-            self.add_card(it, reg)
-        self.mod_offset += len(items)
-        self.mod_msg.configure(text=f"{self.mod_offset} resultados" if items else "Sem resultados.", text_color=MUTED)
-        if len(items) >= 20:
+        self._reg = load_json(REG_FILE, {})
+        self._queue = list(items)
+        self._new = len(items)
+        self._pump(tok)
+
+    def _pump(self, tok):
+        if tok != self.search_token:
+            return
+        for _ in range(3):
+            if not self._queue:
+                break
+            self.add_card(self._queue.pop(0), self._reg)
+        if self._queue:
+            self.after(12, lambda: self._pump(tok))
+            return
+        self.mod_offset += self._new
+        self.mod_msg.configure(text=f"{self.mod_offset} resultados" if self._new else "Sem resultados.", text_color=MUTED)
+        if self._new >= PAGE:
             b = ctk.CTkButton(self.results, text="Carregar mais", fg_color=CARD2, hover_color=CARD,
                               command=lambda: self.do_search(reset=False))
             b._more = True
             b.pack(pady=10)
 
     def add_card(self, it, reg):
-        c = ctk.CTkFrame(self.results, fg_color=CARD, corner_radius=12)
-        c.pack(fill="x", padx=6, pady=4)
+        c = ctk.CTkFrame(self.results, fg_color=CARD, corner_radius=10)
+        c.pack(fill="x", padx=4, pady=3)
         c.grid_columnconfigure(1, weight=1)
-        icon = ctk.CTkLabel(c, text="", width=60, height=60)
-        icon.grid(row=0, column=0, rowspan=2, padx=12, pady=10)
+        icon = ctk.CTkLabel(c, text="", width=52, height=52)
+        icon.grid(row=0, column=0, rowspan=2, padx=10, pady=8)
         self.load_icon(it.get("icon"), icon)
-        ctk.CTkLabel(c, text=it["title"], font=("Segoe UI", 15, "bold"), anchor="w").grid(row=0, column=1, sticky="ew", pady=(10, 0))
-        ctk.CTkLabel(c, text=(it["desc"] or "")[:150], text_color=MUTED, anchor="w", justify="left", wraplength=520).grid(
-            row=1, column=1, sticky="ew", pady=(0, 10))
-        ctk.CTkLabel(c, text=f"⬇ {fmt_num(it['downloads'])}\npor {it['author']}", text_color=MUTED, font=("Segoe UI", 11)).grid(
-            row=0, column=2, rowspan=2, padx=10)
+        ctk.CTkLabel(c, text=f"{it['title']}    ⬇ {fmt_num(it['downloads'])} · {it['author']}",
+                     font=("Segoe UI", 14, "bold"), anchor="w").grid(row=0, column=1, sticky="ew", pady=(8, 0))
+        ctk.CTkLabel(c, text=(it["desc"] or "")[:130], text_color=MUTED, anchor="w", justify="left",
+                     wraplength=560).grid(row=1, column=1, sticky="ew", pady=(0, 8))
         key = ("mr:" if it["source"] == "modrinth" else "cf:") + str(it["id"])
         done = key in reg
         btn = ctk.CTkButton(c, text="Instalado ✓" if done else "Instalar", width=104, height=36,
                             fg_color=CARD2 if done else ACCENT, hover_color=ACCENT_H)
         btn.configure(command=lambda: self.install_item(it, btn))
-        btn.grid(row=0, column=3, rowspan=2, padx=12)
+        btn.grid(row=0, column=2, rowspan=2, padx=10)
 
     def load_icon(self, url, label):
         if not url:
             return
+        if url in self.icons:
+            label.configure(image=self.icons[url])
+            return
 
         def work():
             try:
-                if url not in self.icons:
-                    img = Image.open(io.BytesIO(S.get(url, timeout=15).content)).convert("RGBA").resize((56, 56))
-                    self.icons[url] = ctk.CTkImage(light_image=img, dark_image=img, size=(56, 56))
-                self.ui(lambda: label.configure(image=self.icons[url]))
+                f = ROOT / "cache" / (hashlib.sha1(url.encode()).hexdigest() + ".png")
+                if f.exists():
+                    img = Image.open(f).convert("RGBA")
+                else:
+                    img = Image.open(io.BytesIO(S.get(url, timeout=15).content)).convert("RGBA").resize((52, 52))
+                    f.parent.mkdir(parents=True, exist_ok=True)
+                    img.save(f)
+
+                def apply():
+                    if url not in self.icons:
+                        self.icons[url] = ctk.CTkImage(light_image=img, dark_image=img, size=(52, 52))
+                    try:
+                        label.configure(image=self.icons[url])
+                    except Exception:
+                        pass
+                self.ui(apply)
             except Exception:
                 pass
-        self.pool.submit(work)
+        self.ipool.submit(work)
 
     def install_item(self, it, btn):
         btn.configure(state="disabled", text="A instalar…")
@@ -824,7 +880,7 @@ class App(ctk.CTk):
             e.pack(fill="x", padx=22)
             return e
         self.e_cf = field("Chave da API do CurseForge (grátis em console.curseforge.com)", "curseforge_key", "x-api-key", "•")
-        self.e_ms = field("Azure Client ID (para contas Microsoft originais)", "ms_client_id", "xxxxxxxx-xxxx-…")
+        self.e_ms = field("Azure Client ID (contas originais, ver Contas > Como ativar)", "ms_client_id", "xxxxxxxx-xxxx-…")
         self.e_java = field("Caminho do Java (vazio = automático)", "java_path", "C:\\...\\javaw.exe")
         sw = ctk.CTkSwitch(card, text="Fechar o launcher ao iniciar o jogo", progress_color=ACCENT,
                            command=lambda: self.cfg.update(close_on_launch=bool(sw.get())))
@@ -840,25 +896,75 @@ class App(ctk.CTk):
         self.save()
         self.set_status("Definições guardadas.")
 
+    GUIDE = ("CONTA ORIGINAL (Microsoft) no MVP\n\n"
+             "A Mojang só deixa launchers usarem contas originais com uma app registada e aprovada por eles. "
+             "É grátis, mas feito uma vez só:\n\n"
+             "1) Portal Azure > Registos de aplicações > Novo registo.\n"
+             "   Tipo de conta: 'Apenas contas Microsoft pessoais'.\n"
+             "   URI de redirecionamento: plataforma 'Cliente público/nativo (móvel e ambiente de trabalho)' = http://localhost\n"
+             "2) Em Autenticação, ativa 'Permitir fluxos de cliente público' = Sim.\n"
+             "3) Copia o 'ID da aplicação (cliente)' e cola em Definições > Azure Client ID.\n"
+             "4) Preenche o formulário da Mojang (botão abaixo) a pedir aprovação desse ID. "
+             "Pode demorar alguns dias; até lá o login dá erro 'Invalid app registration'.\n"
+             "5) Volta aqui e carrega em 'Adicionar conta Microsoft': abre o browser, entras, e o MVP apanha o login sozinho.\n\n"
+             "Entretanto podes jogar com contas offline.")
+
+    def ms_guide(self):
+        w = ctk.CTkToplevel(self)
+        w.title("Ativar contas originais")
+        w.geometry("660x500")
+        w.configure(fg_color=BG)
+        w.after(200, w.lift)
+        t = ctk.CTkTextbox(w, fg_color=CARD, wrap="word", font=("Segoe UI", 13))
+        t.pack(fill="both", expand=True, padx=16, pady=(16, 8))
+        t.insert("1.0", self.GUIDE)
+        t.configure(state="disabled")
+        row = ctk.CTkFrame(w, fg_color="transparent")
+        row.pack(fill="x", padx=16, pady=(0, 16))
+        ctk.CTkButton(row, text="Abrir portal Azure", fg_color=ACCENT, hover_color=ACCENT_H,
+                      command=lambda: webbrowser.open(AZURE_URL)).pack(side="left")
+        ctk.CTkButton(row, text="Formulário da Mojang", fg_color=CARD2,
+                      command=lambda: webbrowser.open(MOJANG_FORM)).pack(side="left", padx=8)
+
     def ms_login(self):
         self.save_settings()
         cid = self.cfg["ms_client_id"]
         if not cid:
-            self.acc_msg.configure(text="Põe primeiro o Azure Client ID nas Definições (redirect: " + REDIRECT + ").", text_color=ERR)
+            self.acc_msg.configure(text="Falta o Azure Client ID. Carrega em «Como ativar».", text_color=ERR)
             return
-        try:
-            url, state, verifier = mll.microsoft_account.get_secure_login_data(cid, REDIRECT)
-            webbrowser.open(url)
-            raw = ctk.CTkInputDialog(text="Depois de entrares, cola aqui o URL final da página:", title="Login Microsoft").get_input()
-            if not raw:
-                return
-            code = mll.microsoft_account.parse_auth_code_url(raw.strip(), state)
-        except Exception as e:
-            self.acc_msg.configure(text=f"Login falhou: {e}", text_color=ERR)
-            return
+        self.acc_msg.configure(text="A abrir o browser… entra com a tua conta Microsoft.", text_color=MUTED)
 
         def work():
             try:
+                url, state, verifier = mll.microsoft_account.get_secure_login_data(cid, REDIRECT)
+                port = int(urlparse(REDIRECT).port or 8765)
+                box = {}
+
+                class H(BaseHTTPRequestHandler):
+                    def do_GET(self):
+                        q = parse_qs(urlparse(self.path).query)
+                        box.update({k: v[0] for k, v in q.items()})
+                        self.send_response(200)
+                        self.send_header("Content-Type", "text/html; charset=utf-8")
+                        self.end_headers()
+                        self.wfile.write("<body style='background:#0A0C11;color:#fff;font-family:sans-serif;text-align:center;padding-top:80px'>"
+                                         "<h1>MVP Client</h1><p>Sessão recebida. Podes fechar esta janela.</p></body>".encode("utf-8"))
+
+                    def log_message(self, *a):
+                        pass
+                srv = HTTPServer(("127.0.0.1", port), H)
+                srv.timeout = 240
+                webbrowser.open(url)
+                for _ in range(6):
+                    srv.handle_request()
+                    if "code" in box or "error" in box:
+                        break
+                srv.server_close()
+                if "error" in box:
+                    raise RuntimeError(box.get("error_description", box["error"]))
+                if "code" not in box:
+                    raise RuntimeError("tempo esgotado sem login")
+                code = mll.microsoft_account.parse_auth_code_url(f"{REDIRECT}/?{urlencode(box)}", state)
                 acc = mll.microsoft_account.complete_login(cid, None, REDIRECT, code, verifier)
                 a = {"type": "microsoft", **{k: acc[k] for k in ("id", "name", "access_token", "refresh_token")}}
                 accs = [x for x in self.cfg["accounts"] if x.get("id") != a["id"]]
@@ -867,9 +973,12 @@ class App(ctk.CTk):
                 self.cfg["active"] = len(accs) - 1
                 self.save()
                 self.ui(self.refresh_accounts)
-                self.ui(lambda: self.acc_msg.configure(text=f"Sessão iniciada como {a['name']}.", text_color=OK))
+                self.ui(lambda: self.acc_msg.configure(text=f"✔ Sessão iniciada como {a['name']}.", text_color=OK))
             except Exception as e:
-                self.ui(lambda: self.acc_msg.configure(text=f"Login falhou: {e}", text_color=ERR))
+                msg = str(e)
+                if "Invalid app registration" in msg or "403" in msg:
+                    msg += "  → o teu Client ID ainda não foi aprovado pela Mojang (ver «Como ativar»)."
+                self.ui(lambda: self.acc_msg.configure(text=f"Login falhou: {msg}", text_color=ERR))
         threading.Thread(target=work, daemon=True).start()
 
 
